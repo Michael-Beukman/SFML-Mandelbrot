@@ -6,7 +6,7 @@
 # The idea behind this makefile is that it automatically generates .d dependency files (using something like g++ -MM),
 # and uses this to determine when to recompile which file => only if it or its dependencies changed. This results in faster, incremental builds.
 
-D_FLAGS 		:= -DUSE_SFML -DUSE_CURSES -DUSE_PPM $(DFLAGS)
+D_FLAGS 		:= -DUSE_AVX $(DFLAGS)
 CXX 			?= g++ # /usr/local/Cellar/llvm/12.0.1/bin/clang++
 PROG 			:= main
 
@@ -50,7 +50,7 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.$(SRCEXT)
 
 # Most makefiles have a clean, which just removes some build files (*.o) and the output binary (main)
 clean:
-	rm -rf obj bin
+	rm -rf obj/* bin/*
 
 
 .PHONY: clean

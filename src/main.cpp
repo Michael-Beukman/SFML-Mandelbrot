@@ -1,9 +1,10 @@
-#define WIDTH 800
-#define HEIGHT 800
+#define WIDTH 1600
+#define HEIGHT 1600
 #define USE_OMP
 // #define DEBUG
 int MAX_ITERS = 128;
 int WHICH_SET = 0;
+#include <immintrin.h>
 #include <omp.h>
 
 #include <SFML/Graphics.hpp>
@@ -40,7 +41,7 @@ typedef sf::Vector2<int> vec2i;
 
 struct Application {
     std::vector<int> iteration_count;
-    vec2 scale = {100, 100}, offset = {-WIDTH / 2, -HEIGHT / 2};
+    vec2 scale = {400, 400}, offset = {-WIDTH / 2, -HEIGHT / 2};
     Application() : iteration_count(HEIGHT * WIDTH, 0) {
         offset.x /= scale.x;
         offset.y /= scale.y;
@@ -59,13 +60,22 @@ struct Application {
     }
 
     void update_vec() {
+#ifdef USE_AVX
+        if (WHICH_SET == 0)
+            do_intrinsics();
+        else
+            do_intrinsics_julia();
+        return;
+#endif
+
+// This is the normal, non-avx things
 #ifdef USE_OMP
 #pragma omp parallel for
 #endif
         for (int vec_index = 0; vec_index < WIDTH * HEIGHT; ++vec_index) {
             int x = vec_index % WIDTH;
             int y = vec_index / HEIGHT;
-            vec2 screen_pos = {(float)x, (float)y};
+            vec2 screen_pos = {(double)x, (double)y};
             vec2 world_pos = screen_to_world(screen_pos);
             // now do things
             int iters;
@@ -97,9 +107,199 @@ struct Application {
             z = z.square() + c;
             if (z.norm_sq() >= 4) break;
         }
-
         return iters;
     }
+#ifdef USE_AVX
+    void do_intrinsics() {
+#pragma omp parallel
+        {
+            // how many threads to split up in
+            int num_threads = omp_get_num_threads();
+
+
+            // the scale in the x and y directions
+            __m256d _xscale = _mm256_set1_pd(1 / scale.x);
+            __m256d _yscale = _mm256_set1_pd(1 / scale.y);
+            
+            // Some variables
+            __m256d zr, zi, cr, ci, temp_zr, temp_zi;
+            __m256d zr2, zi2, norm;
+            __m256d four, two;
+            __m256d x, y, _mask1;
+            __m256i _one, _c, _n, _iterations, _mask2;
+            __m256d onetwothreefour = _mm256_set_pd(0.0, 1.0, 2.0, 3.0);
+
+            // set 4 and 2
+            four = _mm256_set1_pd(4.0);
+            two = _mm256_set1_pd(2.0);
+            _one = _mm256_set1_epi64x(1);
+
+            // What is the top left corner of the screen in world space?
+            vec2 test = {0, 0};
+            double offset_x_in_world = screen_to_world(test).x;
+            double offset_y_in_world = screen_to_world(test).y;
+            
+            // x = [0, 1, 2, 3] * scale + offset. The 0, 1, 2, 3 is to offset each element of our vector, as well as starting 
+            // with the first 4 pixels.
+            x = _mm256_add_pd(_mm256_mul_pd(onetwothreefour, _xscale), _mm256_set1_pd(offset_x_in_world));
+            // How many iterations are there?
+            _iterations = _mm256_set1_epi64x(MAX_ITERS);
+            
+            // similarly for y, set it as the offset, and the + (bracket) serves to split the screen into rows for each thread.
+            y = _mm256_set1_pd(offset_y_in_world + (1 / scale.y * HEIGHT / num_threads * omp_get_thread_num()));
+            // Where should we start and end with our loop
+            int start = omp_get_thread_num() * HEIGHT / num_threads * WIDTH;
+            int end = (omp_get_thread_num() + 1) * HEIGHT / num_threads * WIDTH;
+
+            for (int i = start; i < end; i += 4) {
+                if (i % (WIDTH) == 0 && i != 0) {
+                    // new row, so reset things
+                    // x is again the first four pixels in world space.
+                    x = _mm256_add_pd(_mm256_mul_pd(onetwothreefour, _xscale), _mm256_set1_pd(offset_x_in_world));
+                    // add one to y
+                    y = _mm256_add_pd(y, _yscale);
+                }
+                // now we do the maths
+                // c = x + yi
+                ci = y;
+                cr = x;
+                zr = _mm256_setzero_pd();
+                zi = _mm256_setzero_pd();
+                // the iteration count.
+                _n = _mm256_setzero_si256();
+            repeat:
+                // get zr^2
+                zr2 = _mm256_mul_pd(zr, zr);
+                // get zi^2
+                zi2 = _mm256_mul_pd(zi, zi);
+
+                // new_zr = (zr^2 - zi^2) + cr
+                // new_zi = 2 * (zr * zi) + ci
+                temp_zr = _mm256_add_pd(_mm256_sub_pd(zr2, zi2), cr);
+                temp_zi = _mm256_add_pd(_mm256_mul_pd(_mm256_mul_pd(zr, zi), two), ci);
+                
+                // update
+                zr = temp_zr;
+                zi = temp_zi;
+                // get the norm
+                norm = _mm256_add_pd(zr2, zi2);
+                
+                // Not totally sure what this does, compares first
+                _mask1 = _mm256_cmp_pd(norm, four, _CMP_LT_OQ);
+                _mask2 = _mm256_cmpgt_epi64(_iterations, _n);
+                // cast to integer
+                _mask2 = _mm256_and_si256(_mask2, _mm256_castpd_si256(_mask1));
+                _c = _mm256_and_si256(_one, _mask2);  // Zero out ones where n < iterations
+                _n = _mm256_add_epi64(_n, _c);        // n++ Increase all n
+                if (_mm256_movemask_pd(_mm256_castsi256_pd(_mask2)) > 0)
+                    goto repeat;
+                
+                // then update the iteration count
+                iteration_count[i + 0] = int(_n[3]);
+                iteration_count[i + 1] = int(_n[2]);
+                iteration_count[i + 2] = int(_n[1]);
+                iteration_count[i + 3] = int(_n[0]);
+                // update x
+                x = _mm256_add_pd(x, _mm256_mul_pd(_xscale, four));
+            }
+        }
+    }
+
+
+    void do_intrinsics_julia() {
+#pragma omp parallel
+        {
+            // how many threads to split up in
+            int num_threads = omp_get_num_threads();
+
+
+            // the scale in the x and y directions
+            __m256d _xscale = _mm256_set1_pd(1 / scale.x);
+            __m256d _yscale = _mm256_set1_pd(1 / scale.y);
+            
+            // Some variables
+            __m256d zr, zi, cr, ci, temp_zr, temp_zi;
+            __m256d zr2, zi2, norm;
+            __m256d four, two;
+            __m256d x, y, _mask1;
+            __m256i _one, _c, _n, _iterations, _mask2;
+            __m256d onetwothreefour = _mm256_set_pd(0.0, 1.0, 2.0, 3.0);
+
+            cr = _mm256_set1_pd(-0.8);
+            ci = _mm256_set1_pd(0.156);
+            // set 4 and 2
+            four = _mm256_set1_pd(4.0);
+            two = _mm256_set1_pd(2.0);
+            _one = _mm256_set1_epi64x(1);
+
+            // What is the top left corner of the screen in world space?
+            vec2 test = {0, 0};
+            double offset_x_in_world = screen_to_world(test).x;
+            double offset_y_in_world = screen_to_world(test).y;
+            
+            // x = [0, 1, 2, 3] * scale + offset. The 0, 1, 2, 3 is to offset each element of our vector, as well as starting 
+            // with the first 4 pixels.
+            x = _mm256_add_pd(_mm256_mul_pd(onetwothreefour, _xscale), _mm256_set1_pd(offset_x_in_world));
+            // How many iterations are there?
+            _iterations = _mm256_set1_epi64x(MAX_ITERS);
+            
+            // similarly for y, set it as the offset, and the + (bracket) serves to split the screen into rows for each thread.
+            y = _mm256_set1_pd(offset_y_in_world + (1 / scale.y * HEIGHT / num_threads * omp_get_thread_num()));
+            // Where should we start and end with our loop
+            int start = omp_get_thread_num() * HEIGHT / num_threads * WIDTH;
+            int end = (omp_get_thread_num() + 1) * HEIGHT / num_threads * WIDTH;
+
+            for (int i = start; i < end; i += 4) {
+                if (i % (WIDTH) == 0 && i != 0) {
+                    // new row, so reset things
+                    // x is again the first four pixels in world space.
+                    x = _mm256_add_pd(_mm256_mul_pd(onetwothreefour, _xscale), _mm256_set1_pd(offset_x_in_world));
+                    // add one to y
+                    y = _mm256_add_pd(y, _yscale);
+                }
+                // now we do the maths
+                zr = x;
+                zi = y;
+                // the iteration count.
+                _n = _mm256_setzero_si256();
+            repeat:
+                // get zr^2
+                zr2 = _mm256_mul_pd(zr, zr);
+                // get zi^2
+                zi2 = _mm256_mul_pd(zi, zi);
+
+                // new_zr = (zr^2 - zi^2) + cr
+                // new_zi = 2 * (zr * zi) + ci
+                temp_zr = _mm256_add_pd(_mm256_sub_pd(zr2, zi2), cr);
+                temp_zi = _mm256_add_pd(_mm256_mul_pd(_mm256_mul_pd(zr, zi), two), ci);
+                
+                // update
+                zr = temp_zr;
+                zi = temp_zi;
+                // get the norm
+                norm = _mm256_add_pd(zr2, zi2);
+                
+                // Not totally sure what this does, compares first
+                _mask1 = _mm256_cmp_pd(norm, four, _CMP_LT_OQ);
+                _mask2 = _mm256_cmpgt_epi64(_iterations, _n);
+                // cast to integer
+                _mask2 = _mm256_and_si256(_mask2, _mm256_castpd_si256(_mask1));
+                _c = _mm256_and_si256(_one, _mask2);  // Zero out ones where n < iterations
+                _n = _mm256_add_epi64(_n, _c);        // n++ Increase all n
+                if (_mm256_movemask_pd(_mm256_castsi256_pd(_mask2)) > 0)
+                    goto repeat;
+                
+                // then update the iteration count
+                iteration_count[i + 0] = int(_n[3]);
+                iteration_count[i + 1] = int(_n[2]);
+                iteration_count[i + 2] = int(_n[1]);
+                iteration_count[i + 3] = int(_n[0]);
+                // update x
+                x = _mm256_add_pd(x, _mm256_mul_pd(_xscale, four));
+            }
+        }
+    }
+#endif
 };
 
 int main(int argc, char** argv) {
@@ -107,7 +307,7 @@ int main(int argc, char** argv) {
         WHICH_SET = atoi(argv[1]);
     }
     printf("Running with set = %d\n", WHICH_SET);
-    const int size = 4;
+    const int size = 2;
 
     const int WIDTH_IMAGE = WIDTH * size;
     const int HEIGHT_IMAGE = HEIGHT * size;
@@ -140,8 +340,8 @@ int main(int argc, char** argv) {
     while (window.isOpen()) {
         Timer T("Entire Loop");
         sf::Vector2i _mouse_pos = sf::Mouse::getPosition(window);
-        vec2 mouse = {(float)_mouse_pos.x / size, (float)_mouse_pos.y / size};
         while (window.pollEvent(event)) {
+            vec2 mouse = {(double)_mouse_pos.x / size, (double)_mouse_pos.y / size};
             if (event.type == sf::Event::Closed)
                 window.close();
             if (event.type == sf::Event::MouseButtonPressed) {
@@ -231,9 +431,9 @@ int main(int argc, char** argv) {
         window.setTitle("FPS: " + std::to_string(1.0 / ((new_time - time_now) / (float)1e6)));
         window.draw(text);
         // print stats
-        text.setString("Scale: " + std::to_string(app.scale.x) + "\tZoom in and out using Q and A"+
+        text.setString("Scale: " + std::to_string(app.scale.x) + " log10 = " + std::to_string(log10(app.scale.x)) + "\tZoom in and out using Q and A" +
                        "\nOffset: " + std::to_string(app.offset.x) + "," + std::to_string(app.offset.y) + "\tPan using the mouse" +
-                       "\nMaximum iterations: " + std::to_string(MAX_ITERS) + "Increase / Decrease using N and M" + 
+                       "\nMaximum iterations: " + std::to_string(MAX_ITERS) + "\tIncrease / Decrease using N and M" +
                        "\nTime taken to generate the iterations: " + std::to_string(seconds_to_generate)
 
         );

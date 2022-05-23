@@ -10,8 +10,8 @@ D_FLAGS 		:= -DUSE_AVX $(DFLAGS)
 CXX 			?= g++ # /usr/local/Cellar/llvm/12.0.1/bin/clang++
 PROG 			:= main
 
-LIBS			:= -lcurses -lsfml-graphics -lsfml-window -lsfml-system -stdlib=libc++ -L/usr/local/lib -fopenmp
-CXXFLAGS 		:= -I./src -fopenmp -std=c++11 $(D_FLAGS) -O3 -stdlib=libc++ -F/Library/Frameworks -march=native #-I/usr/local/include 
+LIBS			:= -lcurses -lsfml-graphics -lsfml-window -lsfml-system -L/usr/local/lib -fopenmp
+CXXFLAGS 		:= -I./src -fopenmp -std=c++11 $(D_FLAGS) -O3 -F/Library/Frameworks -march=native #-I/usr/local/include 
 
 TARGETDIR 		:= bin
 SRCDIR 			:= src

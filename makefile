@@ -5,29 +5,55 @@
 
 # The idea behind this makefile is that it automatically generates .d dependency files (using something like g++ -MM),
 # and uses this to determine when to recompile which file => only if it or its dependencies changed. This results in faster, incremental builds.
+TARGET 			?= AVX_OMP
 
-D_FLAGS 		:= -DUSE_AVX $(DFLAGS)
-CXX 			?= g++ # /usr/local/Cellar/llvm/12.0.1/bin/clang++
+
+LIBS			:= -lcurses -lsfml-graphics -lsfml-window -lsfml-system -L/usr/local/lib
+CXXFLAGS 		:= -I./src -std=c++11 -O3
+CXX 			?= g++
+SRCEXT 			:= cpp
+SOURCE_FILES    := $(shell find src  -type f -name *.cpp)
+
+ifeq ($(TARGET), CUDA)
+ $(info Making a CUDA Target)
+ D_FLAGS 			:= -DUSE_CUDA
+ CXXFLAGS 			:= $(CXXFLAGS) -Xcompiler -march=native
+ CXX				:= nvcc
+ SRCEXT 			:= cu
+ SOURCE_FILES    	:= src/main.cu
+else ifeq ($(TARGET), AVX)
+ $(info Making an AVX Target)
+ D_FLAGS 			:= -DUSE_AVX
+ LIBS 				:= $(LIBS)  -fopenmp
+ CXXFLAGS 			:= $(CXXFLAGS)  -fopenmp -march=native
+else ifeq ($(TARGET), AVX_OMP)
+ $(info Making an AVX & OMP Target)
+ D_FLAGS 			:= -DUSE_AVX -DUSE_OMP
+ LIBS 				:= $(LIBS)  -fopenmp
+ CXXFLAGS 			:= $(CXXFLAGS)  -fopenmp -march=native
+else ifeq ($(TARGET), OMP)
+ $(info Making an OMP Target)
+ D_FLAGS 			:= -DUSE_OMP
+ LIBS 				:= $(LIBS)  -fopenmp
+ CXXFLAGS 			:= $(CXXFLAGS)  -fopenmp -march=native
+else
+ $(info Normal Build)
+endif
+CXXFLAGS			:= $(CXXFLAGS) $(D_FLAGS)
 PROG 			:= main
-
-LIBS			:= -lcurses -lsfml-graphics -lsfml-window -lsfml-system -L/usr/local/lib -fopenmp
-CXXFLAGS 		:= -I./src -fopenmp -std=c++11 $(D_FLAGS) -O3 -F/Library/Frameworks -march=native #-I/usr/local/include 
 
 TARGETDIR 		:= bin
 SRCDIR 			:= src
 BUILDDIR 		:= obj
 
-SRCEXT 			:= cpp
 OBJEXT 			:= o
 DEPEXT 			:= d
-# Find me all of the source files in this directory and deeper down
-SOURCE_FILES    := $(shell find src  -type f -name *.cpp)
 # Now perform the following rule on these: X.cpp -> X.o
 OBJECT_FILES    := $(patsubst $(SRCDIR)/%,$(BUILDDIR)/%,$(SOURCE_FILES:.$(SRCEXT)=.$(OBJEXT)))
 
 # bin/main: obj/main.o obj/...
 $(TARGETDIR)/$(PROG): $(OBJECT_FILES)
-	@printf "%-10s: linking   %-30s -> %-100s\n" $(CXX) "$^"  $(TARGETDIR)/$(TARGET)
+	@printf "%-10s: linking   %-30s -> %-100s\n" $(CXX) "$^"  $(TARGETDIR)/$(PROG)
 	@mkdir -p bin
 	@$(CXX) $^ $(LIBS) -o  $@
 

@@ -1,20 +1,35 @@
-#define WIDTH 1600
+#define WIDTH  1600
 #define HEIGHT 1600
-#define USE_OMP
-// #define DEBUG
 int MAX_ITERS = 128;
 int WHICH_SET = 0;
-#include <immintrin.h>
+int COLOURSCHEME = 0;
+#ifdef USE_AVX
+    #include <immintrin.h>
+#endif
 #include <omp.h>
-
 #include <SFML/Graphics.hpp>
 #include <SFML/System.hpp>
 #include <SFML/Window.hpp>
 #include <chrono>
 #include <cmath>
 #include <string>
-
 #include "complex.h"
+#ifdef USE_CUDA
+
+void check(cudaError_t code, int line)
+{
+    if (code != cudaSuccess)
+    {
+	fprintf(stderr,"CUDA_SAFE_CALL: %s %d\n", cudaGetErrorString(code), line);
+	exit(code);
+    }
+}
+
+#define checkCudaErrors(val) check((val), __LINE__)
+#include "lib.cu"
+#include "cuda.h"
+#endif
+
 int current_microseconds() {
     std::chrono::time_point<std::chrono::system_clock> now = std::chrono::system_clock::now();
     auto duration = now.time_since_epoch();
@@ -42,9 +57,25 @@ typedef sf::Vector2<int> vec2i;
 struct Application {
     std::vector<int> iteration_count;
     vec2 scale = {400, 400}, offset = {-WIDTH / 2, -HEIGHT / 2};
+
+    #ifdef USE_CUDA
+        int* d_iteration_count;
+        dim3 blockDim, gridDim;
+    #endif
+
     Application() : iteration_count(HEIGHT * WIDTH, 0) {
         offset.x /= scale.x;
         offset.y /= scale.y;
+
+        #ifdef USE_CUDA
+            // malloc the memory on the device
+            checkCudaErrors(cudaMalloc(&d_iteration_count, HEIGHT*WIDTH*sizeof(int)));
+            blockDim.x  = 32;
+            blockDim.y  = 32;
+            gridDim.x = WIDTH  / blockDim.x;
+            gridDim.y = HEIGHT / blockDim.y;
+        #endif
+
     }
 
     vec2 screen_to_world(const vec2& screen) {
@@ -60,6 +91,20 @@ struct Application {
     }
 
     void update_vec() {
+#ifdef USE_CUDA
+        static_assert (WIDTH % 32 == 0, "invalid shape");
+        // run the cuda code
+        if (WHICH_SET == 0){
+            get_mandelbrot_iters<<<gridDim,blockDim>>>(d_iteration_count, WIDTH, HEIGHT, MAX_ITERS, scale.x, scale.y, offset.x, offset.y);
+        }
+        else {
+            get_julia_iters<<<gridDim,blockDim>>>(d_iteration_count, WIDTH, HEIGHT, MAX_ITERS, scale.x, scale.y, offset.x, offset.y);
+        }
+        checkCudaErrors(cudaDeviceSynchronize());
+        checkCudaErrors(cudaMemcpy(iteration_count.data(), d_iteration_count, HEIGHT*WIDTH*sizeof(int), cudaMemcpyDeviceToHost));
+            
+        return;
+#endif
 #ifdef USE_AVX
         if (WHICH_SET == 0)
             do_intrinsics();
@@ -68,7 +113,7 @@ struct Application {
         return;
 #endif
 
-// This is the normal, non-avx things
+// This is the normal, non-avx version
 #ifdef USE_OMP
 #pragma omp parallel for
 #endif
@@ -111,7 +156,9 @@ struct Application {
     }
 #ifdef USE_AVX
     void do_intrinsics() {
+#ifdef USE_OMP
 #pragma omp parallel
+#endif
         {
             // how many threads to split up in
             int num_threads = omp_get_num_threads();
@@ -207,7 +254,9 @@ struct Application {
 
 
     void do_intrinsics_julia() {
+#ifdef USE_OMP
 #pragma omp parallel
+#endif
         {
             // how many threads to split up in
             int num_threads = omp_get_num_threads();
@@ -300,11 +349,21 @@ struct Application {
         }
     }
 #endif
+
+    ~Application(){
+        // free the memory on the GPU
+        #ifdef USE_CUDA
+            (cudaFree(d_iteration_count));
+        #endif
+    }
 };
 
 int main(int argc, char** argv) {
     if (argc == 2) {
         WHICH_SET = atoi(argv[1]);
+    }else if (argc == 3){
+        WHICH_SET  = atoi(argv[1]);
+        COLOURSCHEME = atoi(argv[2]);
     }
     printf("Running with set = %d\n", WHICH_SET);
     const int size = 2;
@@ -360,16 +419,16 @@ int main(int argc, char** argv) {
                 start_pan.x = mouse.x;
                 start_pan.y = mouse.y;
             }
+            vec2 mouse_in_world_before_zoom = app.screen_to_world(mouse);
 
             if (event.type == sf::Event::MouseWheelScrolled) {
-                if (event.mouseWheel.delta > 0) {
-                    app.scale *= 1.01;
+                if (event.mouseWheelScroll.delta > 0) {
+                    app.scale *= 1.1;
                 } else {
-                    app.scale *= 0.99;
+                    app.scale *= 0.9;
                 }
             }
 
-            vec2 mouse_in_world_before_zoom = app.screen_to_world(mouse);
 
             if (event.type == sf::Event::KeyPressed) {
                 if (event.key.code == sf::Keyboard::Key::Q) {
@@ -398,10 +457,18 @@ int main(int argc, char** argv) {
                     int index_other = (y)*WIDTH + x;
                     float a = 0.1;
                     float n = (float)app.iteration_count[index_other];
-
-                    float r = 0.5f * sin(a * n) + 0.5f;
-                    float g = 0.5f * sin(a * n + 2.094f) + 0.5f;
-                    float b = 0.5f * sin(a * n + 4.188f) + 0.5f;
+                    
+                    float r, g, b;
+                    if (COLOURSCHEME == 0){
+                        // from here: https://github.com/OneLoneCoder/Javidx9/blob/master/PixelGameEngine/SmallerProjects/OneLoneCoder_PGE_Mandelbrot.cpp#L543
+                        r = 0.5f * sin(a * n) + 0.5f;
+                        g = 0.5f * sin(a * n + 2.094f) + 0.5f;
+                        b = 0.5f * sin(a * n + 4.188f) + 0.5f;
+                    }else if (COLOURSCHEME == 1){
+                        r = n / MAX_ITERS;
+                        g = n / MAX_ITERS;
+                        b = n / MAX_ITERS;
+                    }
                     for (int i = 0; i < size; ++i) {
                         for (int j = 0; j < size; ++j) {
                             int index = (y * size + i) * WIDTH_IMAGE + (x * size + j);
